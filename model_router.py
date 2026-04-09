@@ -73,7 +73,7 @@ PORT = 8888
 JUDGE_MODEL = "qwen2.5:1.5b"
 OLLAMA_PORT = 11434
 OLLAMA_TIMEOUT = 8
-DASHSCOPE_API_KEY = "your-dashscope-api-key-here"  # Replace with your actual key
+DASHSCOPE_API_KEY = "sk-a0a0c3b93a5042b494bf025f691f461f"
 # DashScope native Anthropic-compatible endpoint — no format conversion needed
 DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/apps/anthropic"
 CHEAP_MODEL = "qwen3.5-flash"
