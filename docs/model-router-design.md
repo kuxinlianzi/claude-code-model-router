@@ -123,10 +123,11 @@
 │                                 │                                │
 │  ┌──────────────────────────────▼─────────────────────────────┐ │
 │  │  Complexity Judge Module                                   │ │
-│  │  ├─ Input: user messages + system prompt                   │ │
-│  │  ├─ Trim to 3000 chars if needed                           │ │
-│  │  ├─ Call Ollama qwen2.5:1.5b                               │ │
-│  │  └─ Output: integer 1-10                                   │ │
+│  │  ├─ Extract & filter user messages                        │ │
+│  │  ├─ Take LAST valid user message only                     │ │
+│  │  ├─ Truncate to 2000 chars if needed                     │ │
+│  │  ├─ Call Ollama via /api/generate (not /api/chat)        │ │
+│  │  └─ Output: integer 1-10                                 │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │                                 │                                │
 │  ┌──────────────────────────────▼─────────────────────────────┐ │
@@ -157,9 +158,10 @@
 
 | 模块 | 职责 | 关键技术 |
 |------|------|---------|
-| **FastAPI Server** | 接收请求、路由分发、响应返回 | FastAPI, uvicorn |
+| **FastAPI Server** | 接收请求、消息过滤、路由分发、响应返回 | FastAPI, uvicorn |
 | **HTTP Client Pool** | 连接复用、超时控制、重试机制 | httpx.AsyncClient |
-| **Complexity Judge** | 调用本地小模型评估任务难度 | Ollama API |
+| **Message Filter** | 提取真实用户指令、过滤工具响应和 UI 干扰 | `extract_text_content`, `is_valid_user_message` |
+| **Complexity Judge** | 调用本地小模型评估任务难度 | Ollama `/api/generate` |
 | **Routing Logic** | 根据分数决定目标模型 | 规则引擎 |
 | **Proxy to DashScope** | 转发请求、流式传输、token 统计 | SSE passthrough |
 
@@ -241,6 +243,8 @@ if body.get("stream"):
 
 ### 4.4 复杂度评估提示词设计
 
+**2026-04-10 更新**: 改用 `/api/generate` 端点，精简 Prompt 结构，提升小模型指令跟随能力
+
 **Prompt 结构**：
 
 ```
@@ -273,13 +277,59 @@ Level 10: 复杂数学推导、创新算法设计、庞大世界观构建
 [用户任务内容]
 ```
 
-**设计理由**：
-- 分区间描述让评分标准更清晰
-- 给出具体例子降低歧义
-- 明确的 4 个评估维度引导评分
-- 强调"只输出整数"确保解析可靠性
+**Prompt 结构优化**：
 
-### 4.5 默认降级策略
+1. **Instruction 前置**: 将 role definition + classification criteria 放在开头，让模型先"记住任务要求"
+2. **Context 隔离**: 只传最后一条用户消息，不传 system prompt 和历史对话
+3. **结尾提示词**: 在 user input 后加 "Complexity score:"，引导模型直接输出数字
+4. **截断阈值**: 从 3000 字符降至 2000 字符（小模型处理长文能力弱）
+
+**技术改进细节**：
+
+**A. 消息过滤 (新增)**
+
+```python
+async def extract_text_content(message: dict) -> str:
+    """从 message dict 中提取纯文本内容"""
+    ...
+
+def is_valid_user_message(text: str) -> bool:
+    """过滤工具响应和 UI 干扰"""
+    if any(pattern in text_lower for pattern in [
+        '<tool_use_id', '<tool-result', 'tool_result',
+        '<system-reminder', 'sessionstart hook',
+        'exit code', 'parse error', '/clear', ...
+    ]):
+        return False
+    return True
+```
+
+**B. `/api/generate` vs `/api/chat`**
+
+| 端点 | 输入格式 | 对小模型友好度 |
+|------|---------|--------------|
+| `/api/chat` | `messages=[{"role": "user", "content": "..."}]` | ⭐⭐ |
+| `/api/generate` | `prompt="instruction\n\nUser input\nOutput:"` | ⭐⭐⭐⭐⭐ |
+
+**原因**: `qwen2.5:1.5b` 的指令跟随能力较弱，需要更清晰的 instruction→context→output 三段式结构。
+
+**C. 错误处理增强**
+
+```python
+# 解析逻辑：优先匹配行首数字，fallback 到全文搜索 1-9 单 digit
+for line in lines:
+    match = re.match(r'^(\d+)', stripped)
+    ...
+if score is None:
+    log(f"[WARN] Judge parsing error...")
+    return 5  # 降级策略
+```
+
+---
+
+---
+
+### 4.6 默认降级策略
 
 ```python
 try:
@@ -289,10 +339,9 @@ except Exception as e:
     return 5
 ```
 
-**设计理由**：
-- 当评测器失败时回退到中等复杂度 (5)
-- 5 分是轻量级区间的上限，避免误判为高复杂度而浪费资源
-- 同时保证服务可用性——即使评测失效，仍能提供服务
+### 4.6 默认降级策略
+
+当评测器失败时回退到中等复杂度 (5)，保证服务可用性。
 
 ---
 
@@ -387,9 +436,125 @@ Content-Type: application/json
 
 ---
 
-## 8. 未来演进方向
+---
 
-### 8.1 多级路由（3+ 档位）
+## 8. 并发控制与响应排序 (2026-04-10)
+
+### 8.1 问题描述
+
+当多个并发请求到达时，由于不同复杂度模型的处理时间差异和网络延迟波动，可能导致**后提交的请求先于之前提交的请求返回结果**。例如：
+
+1. 请求 A（complexity ≥ 6 → qwen3.6-plus）评测耗时 5s，模型响应 8s
+2. 请求 B（complexity < 6 → qwen3.5-flash）评测耗时 1s，模型响应 3s
+
+B 可能比 A 早完成 4 秒，导致前端收到的消息顺序错乱。
+
+此外，流式响应出错时（如网络断开），原代码只 `yield err` 但**不会调用 enqueue_response()**，导致后续请求永久阻塞在 `dequeue_ordered_response()`，造成死锁。
+
+### 8.2 解决方案：FIFO 队列 + 超时机制
+
+#### 全局状态管理
+
+```python
+_response_queue = asyncio.Queue()  # FIFO queue: (sequence_id, bytes_data)
+_order_lock = asyncio.Lock()
+_sequence_counter = 0
+
+async def enqueue_response(raw_bytes: bytes) -> int:
+    """收集完整响应并加入有序队列释放。返回序列号"""
+    global _sequence_counter
+    async with _order_lock:
+        seq = _sequence_counter
+        _sequence_counter += 1
+    await _response_queue.put((seq, raw_bytes))
+    return seq
+
+async def dequeue_ordered_response() -> bytes:
+    """阻塞等待下一个有序响应可用。"""
+    _, data = await _response_queue.get()
+    return data
+```
+
+#### Buffer-Then-Yield 模式
+
+修改 `proxy_to_dashscope` 中的流式处理逻辑：
+
+```python
+if body.get("stream"):
+    async def event_stream():
+        try:
+            resp = await request_with_retry(...)
+            
+            # 第一步：完整收集所有 chunks（不立即 yield）
+            full_text_parts = []
+            async for chunk in resp.aiter_bytes():
+                full_text_parts.append(chunk)  # 仅缓冲，无修改
+            
+            # 第二步：解析 token 统计
+            full_text = b"".join(full_text_parts).decode("utf-8", errors="ignore")
+            # ... parse input_tokens, output_tokens ...
+            
+            # 第三步：将完整响应加入队列
+            await enqueue_response(b"".join(full_text_parts))
+            
+            # 第四步：带超时等待自己的轮次（防死锁）
+            timeout_sec = 60 if model == EXPENSIVE_MODEL else 30
+            
+            try:
+                yielded_data = await asyncio.wait_for(
+                    dequeue_ordered_response(),
+                    timeout=timeout_sec
+                )
+                yield yielded_data
+            except asyncio.TimeoutError:
+                log(f"[WARN] Request timeout for {model} after {timeout_sec}s")
+                
+        except httpx.ConnectError as e:
+            log(f"[ERROR] DashScope connection failed: {e}")
+            err = json.dumps({"error": {"type": "connection_error", ...}}).encode()
+            await enqueue_response(err)  # 错误时也入队，防止死锁
+            yield err
+```
+
+### 8.3 超时策略
+
+| 模型类型 | 等待超时 | 适用场景 |
+|---------|---------|----------|
+| 轻量级 (qwen3.5-flash) | 30 秒 | 简单任务，快速失败 |
+| 重量级 (qwen3.6-plus) | 60 秒 | 复杂任务，允许更长等待 |
+
+超时后的行为：**静默跳过该请求**，继续处理后续请求。避免一个卡住的请求拖垮整个服务。
+
+### 8.4 设计权衡
+
+| 方面 | 优化前 | 优化后 |
+|------|--------|-------|
+| **顺序保证** | 无 - 真透传 | 严格 FIFO |
+| **延迟** | 极低 - 即时流式 | 较高 - 需等待前序释放 |
+| **内存占用** | 低 - 逐块流式 | 较高 - 整响应缓冲 |
+| **鲁棒性** | 错误时可能死锁 | 超时降级，永不挂起 |
+
+### 8.5 测试建议
+
+1. **并发压力测试**：同时发起 5+ 个不同复杂度的请求，验证返回顺序
+2. **超时触发测试**：人为模拟上游延迟超过 30/60 秒，验证优雅降级
+3. **错误恢复测试**：模拟网络中断，验证队列不会被永久阻塞
+4. **解析错误验证**：测试 Ollama 返回非标准格式时的默认行为
+
+```bash
+# 测试复杂度 1（问候/测试类）
+curl -X POST http://localhost:8888/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "test"}], "stream": false}'
+
+# 预期输出包含 "qwen3.5-flash"（复杂度 < 6）
+```
+
+---
+
+## 7. 未来演进方向
+
+### 7.1 多级路由（3+ 档位）
 
 当前二分法可扩展为三级：
 
@@ -399,7 +564,7 @@ Level 4-6  → 均衡模型（如 qwen3.5-flash）
 Level 7-10 → 最强模型（如 qwen3.6-plus）
 ```
 
-### 8.2 缓存机制
+### 7.2 缓存机制
 
 对重复的相同 query 直接返回缓存结果，避免重复调用：
 
@@ -409,7 +574,7 @@ if cache.exists(cache_key):
     return cache.get(cache_key)
 ```
 
-### 8.3 异步评测器
+### 7.3 异步评测器
 
 当前复杂度评测阻塞主线程，可改造为独立协程预先评估：
 
@@ -419,7 +584,7 @@ score_task = asyncio.create_task(judge_complexity(...))
 score = await score_task
 ```
 
-### 8.4 A/B 测试框架
+### 7.4 A/B 测试框架
 
 对不同任务随机分配两种评分策略，对比效果：
 
@@ -432,7 +597,7 @@ else:
 
 ---
 
-## 9. 总结
+## 7.5 总结
 
 智能路由网关的核心价值在于**"用最小代价实现最佳效果平衡"**：
 

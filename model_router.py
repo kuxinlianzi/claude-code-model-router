@@ -73,7 +73,7 @@ PORT = 8888
 JUDGE_MODEL = "qwen2.5:1.5b"
 OLLAMA_PORT = 11434
 OLLAMA_TIMEOUT = 8
-DASHSCOPE_API_KEY = "sk-a0a0c3b93a5042b494bf025f691f461f"
+DASHSCOPE_API_KEY = "your-api-key-here"
 # DashScope native Anthropic-compatible endpoint — no format conversion needed
 DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/apps/anthropic"
 CHEAP_MODEL = "qwen3.5-flash"
@@ -88,20 +88,75 @@ def log(msg: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
+async def extract_text_content(message: dict) -> str:
+    """Extract readable text content from a message dict."""
+    content = message.get("content", "")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, str):
+                    texts.append(text.strip())
+        return " ".join(texts)
+
+    return str(content).strip()
+
+
+def is_valid_user_message(text: str) -> bool:
+    """Check if this looks like a valid natural language user message."""
+    text_lower = text.lower().strip()
+
+    # Special handling for "test" - it's a valid (low complexity) input
+    if text_lower in ("test", "testing"):
+        return True
+
+    # Filter out tool-related content and UI artifacts
+    if any(pattern in text_lower for pattern in [
+        '<tool_use_id', '<tool-result', 'tool_result',
+        '<tool-use', 'tool_use_', 'toolresult',
+        'command running in background', 'output is being written to',
+        '<system-reminder', 'sessionstart hook',
+        'task # created successfully',
+        'exit code', 'parse error', 'syntaxerror',
+        'blocked', 'not ready', '/clear', '<tool_use_error>',
+        '<tool-use-error>', 'sleep followed by',
+        '<retrieval_status>', 'background agent completed'
+    ]):
+        return False
+
+    # Must contain at least some letters, digits, or Chinese/Japanese characters
+    has_letters = any(c.isalpha() for c in text)
+    has_digits = any(c.isdigit() for c in text)
+    has_chinese = any('\u4e00' <= c <= '\u9fff' for c in text)
+    has_japanese = any('\u3040' <= c <= '\u30ff' for c in text)
+
+    if not (has_letters or has_digits or has_chinese or has_japanese):
+        return False
+
+    return True
+
+
 # ─── Complexity Judge ────────────────────────────────────────────────
 
 async def judge_complexity(user_messages: list, system_prompt: str = "") -> int:
     """Ask Ollama to classify task complexity. Returns integer 1-10."""
-    context = ""
-    if system_prompt:
-        context = f"System context: {system_prompt}\n\n"
-    context += "User task: " + " | ".join(
-        m.get("content", "") if isinstance(m.get("content", ""), str) else str(m["content"])
-        for m in user_messages
-    )
-    if len(context) > 3000:
-        context = context[:3000] + "..."
+    # Only use the LAST valid user message - exclude system_prompt and prior context
+    # to avoid polluting the judgment with irrelevant context
+    if not user_messages:
+        context = "(no valid messages)"
+    else:
+        text = await extract_text_content(user_messages[-1])
+        context = text if text else "(no valid messages)"
 
+    if len(context) > 2000:
+        context = context[:2000] + "..."
+
+    # Use /api/generate for better instruction-following with small models
     prompt = (
         "You are a top-tier LLM Router Gateway. Evaluate the semantic complexity and logical reasoning depth of the user's input, and output a complexity score from 1 to 10.\n\n"
         "=== Lightweight Interval: Levels 1-5 (Execution-layer tasks: no deep reasoning, pattern matching) ===\n"
@@ -119,25 +174,65 @@ async def judge_complexity(user_messages: list, system_prompt: str = "") -> int:
         "Level 10: Extremely complex math derivations, innovative algorithm design beyond conventional thinking, massive intertwined novel worldbuilding.\n\n"
         "Evaluate considering: (1) Multi-step reasoning needed? (2) Many constraints? (3) Requires professional expertise? (4) High cost of error?\n"
         "Respond with ONLY a single integer from 1 to 10, nothing else.\n\n"
-        f"Task:\n{context}"
+        f"User input: {context}\nComplexity score:"
     )
 
     payload = {
         "model": JUDGE_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0, "num_predict": 5},
+        "options": {"temperature": 0, "num_predict": 3},
     }
 
     try:
         client = get_http_client()
-        resp = await client.post(f"http://localhost:{OLLAMA_PORT}/api/chat", json=payload)
+        resp = await client.post(f"http://localhost:{OLLAMA_PORT}/api/generate", json=payload)
         data = resp.json()
-        content = data.get("message", {}).get("content", "").strip()
-        score = int(content)
-        return max(1, min(10, score))
-    except (ValueError, TypeError):
-        log(f"[WARN] Judge returned invalid value: {content}, defaulting to 5")
+        content = data.get("response", "").strip()
+
+        if not content:
+            log("[WARN] Judge returned empty response, defaulting to 5")
+            return 5
+
+        # Extract complexity score - look for the FIRST single digit at the start of line
+        # or just the number itself (to avoid matching numbers in example text like "Level 5")
+        lines = content.strip().split('\n')
+        score = None
+
+        # Try to find a standalone number (1-10) as the first non-empty token
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # Check if line starts with a number followed by whitespace/punctuation/end
+            match = re.match(r'^(\d+)', stripped)
+            if match:
+                candidate = int(match.group(1))
+                if 1 <= candidate <= 10:
+                    score = candidate
+                    break
+            elif stripped.isdigit():
+                # Line is just a number
+                candidate = int(stripped)
+                if 1 <= candidate <= 10:
+                    score = candidate
+                    break
+
+        if score is None:
+            # Fallback: search for any standalone 1-digit number (prefer digits 1-9 over 10)
+            # But exclude matches that are clearly part of level descriptions
+            match = re.search(r'(?:^|[^0-9])([1-9])(?:[^0-9]|$)', content[:200])  # Only check first 200 chars
+            if match:
+                score = int(match.group(1))
+
+        if score is None:
+            log(f"[WARN] Judge parsing error: '{content}', defaulting to 5")
+            return 5
+
+        return score
+    except (ValueError, TypeError) as e:
+        log(f"[WARN] Judge parsing error: '{content}', error: {e}, defaulting to 5")
         return 5
     except Exception as e:
         log(f"[WARN] Judge failed ({e}), defaulting to 5")
@@ -198,7 +293,7 @@ async def proxy_to_dashscope(request: Request, model: str, complexity_score: int
                     output_tokens = int(matches[-1])
 
                 log(
-                    f"  [complexity={complexity_score}/10] {model} | tokens: input={input_tokens}, output={output_tokens}"
+                    f"[complexity={complexity_score}/10] upstream_tokens: input={input_tokens}, output={output_tokens}"
                 )
 
             except httpx.ConnectError as e:
@@ -267,14 +362,31 @@ async def health():
 @app.post("/messages")
 async def messages(request: Request):
     body = await request.json()
-    messages = body.get("messages", [])
+    all_messages = body.get("messages", [])
     system_prompt = body.get("system", "")
     stream = body.get("stream", True)
 
-    user_msgs = [m for m in messages if m.get("role") == "user"]
+    # Extract user messages and filter out non-natural-language content
+    raw_user_msgs = [m for m in all_messages if m.get("role") == "user"]
+
+    # Filter to only include valid natural language messages
+    valid_user_msgs = []
+    for i, msg in enumerate(raw_user_msgs):
+        extracted_text = await extract_text_content(msg)
+        is_valid = is_valid_user_message(extracted_text)
+        if is_valid:
+            valid_user_msgs.append(msg)
+
+    # Use the LAST valid user message for judging
+    if valid_user_msgs:
+        final_user_msgs = valid_user_msgs[-1:]
+    elif raw_user_msgs:
+        final_user_msgs = raw_user_msgs[-1:]
+    else:
+        final_user_msgs = []
 
     start = time.time()
-    score = await judge_complexity(user_msgs, system_prompt)
+    score = await judge_complexity(final_user_msgs, system_prompt)
     judge_time = time.time() - start
     model = EXPENSIVE_MODEL if score >= 6 else CHEAP_MODEL
 

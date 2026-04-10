@@ -28,6 +28,8 @@
 - 🧠 **智能决策** - 基于语义理解的自动复杂度评分
 - ⚡ **零延迟体验** - 流式传输透明透传，无明显额外延迟
 - 🔒 **安全可靠** - 连接池、重试机制、优雅降级
+- ✅ **精准过滤** - 自动排除工具消息和 UI 干扰，只提取真实用户指令
+- ✅ **顺序保证** - FIFO 队列确保并发请求按序返回，超时防死锁
 
 ---
 
@@ -42,8 +44,10 @@
 ┌─────────────────────────────────────────┐
 │         Complexity Judge                │  Ollama (qwen2.5:1.5b)
 │    ┌──────────────────────────────┐    │
-│    │ 1. Extract user messages     │    │
-│    │ 2. Truncate to 3000 chars    │    │
+│    │ 1. Extract & Filter messages │    │
+│    │    → Remove tool/UI artifacts│    │
+│    │    → Take LAST user message  │    │
+│    │ 2. Truncate to 2000 chars    │    │
 │    │ 3. Ask judge model → score   │    │
 │    │ 4. Return 1-10 complexity    │    │
 │    └──────────────────────────────┘    │
@@ -221,8 +225,8 @@ curl http://localhost:8888/
 运行时输出详细信息：
 
 ```
-[2026-04-09 18:45:32] [complexity=7/10] judge=1.23s → qwen3.6-plus
-  [complexity=7/10] qwen3.6-plus | tokens: input=128, output=512
+[2026-04-10 23:19:12] [complexity=1/10] judge=1.07s → qwen3.5-flash
+[2026-04-10 23:19:14] [complexity=1/10] upstream_tokens: input=31121, output=34
 ```
 
 ### 日志字段说明
@@ -232,7 +236,36 @@ curl http://localhost:8888/
 | `complexity=X/10` | 评估到的复杂度分数 |
 | `judge=Y.YYs` | 复杂度评估耗时 |
 | `model` | 最终选择的模型 |
-| `tokens` | 输入/输出 token 数量 |
+| `upstream_tokens` | 上游模型实际使用的输入/输出 token |
+
+---
+
+## 🛠️ 今日更新 (2026-04-10)
+
+### 核心改进
+
+**精准指令提取修复** - 解决 Judge 模型误判问题
+
+**问题诊断**：
+- 原始实现将所有用户消息和 system prompt 拼接后传入 Judge，导致上下文污染
+- Judge 看到大量历史对话和系统信息，返回固定分值（总是 5）
+
+**解决方案**：
+1. **新增 `is_valid_user_message()` 过滤函数** - 自动识别并排除工具响应、UI 干扰等信息
+2. **只保留最后一条真实用户指令** - 避免多轮对话中的历史内容影响判断
+3. **改用 `/api/generate` 端点** - 小模型的指令跟随能力优于 `/api/chat`
+4. **精简 Prompt 结构** - 将 instruction 放在开头，user input 紧接其后，末尾加"Complexity score:"提示词
+
+**技术细节**：
+- 上下文截断从 3000 字符降至 2000 字符
+- 移除所有 DEBUG 日志，只保留关键业务日志
+- Judge raw response 错误处理增强
+
+**效果对比**：
+| 输入 | 修复前 | 修复后 |
+|------|--------|--------|
+| "你好" | 5 (错误) | 1 (正确) |
+| "帮我分析代码" | 5 (可能错误) | 6+ (准确) |
 
 ---
 
@@ -250,7 +283,20 @@ curl http://localhost:8888/
 
 ### 关键设计
 
-**连接池管理**
+**指令精准提取 (2026-04-10)**
+- `extract_text_content()`: 从 message dict 中提取纯文本内容，支持 str/list/dict 多种格式
+- `is_valid_user_message()`: 过滤工具响应和 UI 干扰（tool_result, system-reminder, exit code 等）
+- 只取最后一条有效的用户消息作为复杂度评估依据
+- 避免历史对话和系统信息污染 Judge 模型的判断
+
+**上下文隔离** - 移除 system prompt 在 judging 中的影响，专注于用户真实意图
+
+**FIFO 响应排序 (2026-04-10)**
+- 并发请求按提交顺序返回结果
+- Buffer-first 模式：先完整收集响应，再按序 release
+- 超时防死锁机制：简单模型 30s/复杂模型 60s
+- 错误时自动入队，避免队列永久阻塞
+**连接池管理 (2026-04-10)** - 已简化，使用 httpx.AsyncClient 全局单例维持连接池
 ```python
 _global_client = httpx.AsyncClient(
     timeout=300.0,
@@ -268,6 +314,12 @@ wait = 0.5 * (2**attempt) + random.uniform(0, 0.3)
 ```
 
 **流式传输透明透传** - 字节级转发，零格式损耗
+
+**FIFO 响应排序 (2026-04-10)**
+- 并发请求按提交顺序返回结果
+- Buffer-first 模式：先完整收集响应，再按序 release
+- 超时防死锁机制：简单模型 30s/复杂模型 60s
+- 错误时自动入队，避免队列永久阻塞
 
 ---
 
@@ -288,6 +340,8 @@ claude-code-model-router/
 
 ## 🔮 未来演进方向
 
+- ✅ **[x] 精准指令过滤** - 2026-04-10 已实现：自动排除工具响应，只提取真实用户意图
+- ✅ **[x] FIFO 响应排序** - 2026-04-10 已实现：按提交顺序返回，超时防死锁
 - **[ ] 多级路由** - 支持 3+ 档位模型选择
 - **[ ] 缓存机制** - 重复 query 直接返回缓存结果
 - **[ ] 异步评测器** - 预评估降低延迟
