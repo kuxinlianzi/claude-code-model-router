@@ -1,0 +1,28 @@
+# Model Router Configuration
+# Copy this file to config.yaml and modify as needed
+
+server:
+  host: "localhost"        # Use 0.0.0.0 to allow external access
+  port: 8888               # Server port
+
+judge:
+  model: "qwen3.5:2b"      # Ollama model for complexity judgment
+  ollama_host: "localhost"
+  ollama_port: 11434
+  timeout: 8               # Timeout in seconds for Ollama requests
+  truncate_limit: 2000     # Max characters to truncate user input
+
+routing:
+  cheap_model: "qwen3.5-flash"    # Model for lightweight tasks (1-5)
+  expensive_model: "qwen3.6-plus" # Model for heavyweight tasks (6-10)
+  threshold: 6                    # Score threshold (>= threshold goes to expensive)
+
+dashscope:
+  api_key: ""              # Your DashScope API key (required)
+  base_url: "https://dashscope.aliyuncs.com/apps/anthropic"
+
+client:
+  max_connections: 100            # Max connections for connection pool
+  max_keepalive_connections: 20   # Max keepalive connections
+  keepalive_expiry: 60.0          # Keepalive timeout in seconds
+  default_timeout: 60.0           # Default timeout for DashScope requests

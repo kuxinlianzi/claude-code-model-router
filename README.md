@@ -9,7 +9,37 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 
+**最新版本**: 2026-04-12
+
 </div>
+
+---
+
+## 🔐 安全与隐私
+
+### API Key 管理
+
+本项目采用**配置与环境变量分离**的设计理念：
+
+1. **配置文件中不提交密钥** - `config.yaml` 已加入 `.gitignore`
+2. **支持环境变量注入** - CI/CD 部署推荐方式
+3. **提供设置脚本** - `setup_config.sh` 交互式配置
+
+```bash
+# 安全配置方式 1: 使用设置脚本（推荐）
+./setup_config.sh
+
+# 安全配置方式 2: 环境变量
+export DASHSCOPE_API_KEY="sk-your-key"
+python3 model_router.py
+```
+
+### 网络访问控制
+
+默认配置绑定到 `localhost`，防止外部访问：
+
+- ✅ **本地开发**: `host: "localhost"` (默认)
+- ⚠️ **允许外部**: `host: "0.0.0.0"` (需配合防火墙规则)
 
 ---
 
@@ -27,9 +57,10 @@
 - 💰 **成本优化** - 简单任务节省高达 50% API 费用
 - 🧠 **智能决策** - 基于语义理解的自动复杂度评分
 - ⚡ **零延迟体验** - 流式传输透明透传，无明显额外延迟
-- 🔒 **安全可靠** - 连接池、重试机制、优雅降级
+- 🔒 **安全可靠** - 连接池、重试机制、优雅降级、本地化配置
 - ✅ **精准过滤** - 自动排除工具消息和 UI 干扰，只提取真实用户指令
 - ✅ **顺序保证** - FIFO 队列确保并发请求按序返回，超时防死锁
+- 🚀 **双客户端** - 独立 Ollama 专用客户端，优化超时配置
 
 ---
 
@@ -42,13 +73,14 @@
        │
        ▼
 ┌─────────────────────────────────────────┐
-│         Complexity Judge                │  Ollama (qwen2.5:1.5b)
+│         Complexity Judge                │  Ollama (qwen3.5:2b)
 │    ┌──────────────────────────────┐    │
 │    │ 1. Extract & Filter messages │    │
 │    │    → Remove tool/UI artifacts│    │
 │    │    → Take LAST user message  │    │
 │    │ 2. Truncate to 2000 chars    │    │
 │    │ 3. Ask judge model → score   │    │
+│    │    (via /api/generate)       │    │
 │    │ 4. Return 1-10 complexity    │    │
 │    └──────────────────────────────┘    │
 └──────────────┬──────────────────────────┘
@@ -80,44 +112,73 @@ brew install ollama        # macOS
 # or see https://ollama.com for other platforms
 
 # 2. Pull judge model
-ollama pull qwen2.5:1.5b
+ollama pull qwen3.5:2b
 
 # 3. Python dependencies
-pip install fastapi httpx uvicorn
+pip install fastapi httpx uvicorn pyyaml
 ```
 
 ### 安装依赖
 
 ```bash
 # From project root
-pip install fastapi httpx uvicorn
+pip install fastapi httpx uvicorn pyyaml
 ```
 
-### 配置
+### 配置 API Key
 
-在 `model_router.py` 中修改以下配置项：
+**Option 1: Interactive Setup (Recommended)**
 
-```python
-# 替换为你的实际密钥
-DASHSCOPE_API_KEY = "your-dashscope-api-key-here"
+```bash
+chmod +x setup_config.sh
+./setup_config.sh
+```
 
-# 路由目标模型
-CHEAP_MODEL = "qwen3.5-flash"      # 轻量级（Level 1-5）
-EXPENSIVE_MODEL = "qwen3.6-plus"   # 重量级（Level 6-10）
+This script will prompt you to enter your DashScope API key and configure it securely in `config.yaml`.
 
-# 本地评测模型
-JUDGE_MODEL = "qwen2.5:1.5b"       # Ollama 中需已存在此模型
-OLLAMA_PORT = 11434                # Ollama 服务端口
+**Option 2: Manual Configuration**
+
+1. Copy the example config file:
+```bash
+cp config.example.yaml config.yaml
+```
+
+2. Edit `config.yaml` and add your API key:
+```yaml
+dashscope:
+  api_key: "sk-your-actual-api-key-here"  # Required! Get from https://dashscope.aliyun.com/
+```
+
+**Option 3: Environment Variables**
+
+For CI/CD deployments, use environment variables:
+```bash
+export DASHSCOPE_API_KEY="sk-your-actual-api-key-here"
+python3 model_router.py
+```
+
+Or all settings:
+```bash
+export MODEL_ROUTER_SERVER_HOST=0.0.0.0 \
+       MODEL_ROUTER_SERVER_PORT=9000 \
+       MODEL_ROUTER_JUDGE_MODEL=qwen3.5:2b \
+       MODEL_ROUTER_DASHSCOPE_API_KEY=sk-xxx
 ```
 
 ### 启动服务
 
 ```bash
-# 默认端口 8888
+# Use existing config.yaml
 python3 model_router.py
 
-# 自定义端口
+# Custom port (overrides config)
 python3 model_router.py --port 9000
+
+# Custom host (for external access - ensure firewall is configured!)
+python3 model_router.py --host 0.0.0.0 --port 8888
+
+# Custom config file
+python3 model_router.py --config my-config.yaml
 ```
 
 ### 验证运行
@@ -125,6 +186,61 @@ python3 model_router.py --port 9000
 ```bash
 curl http://localhost:8888/health
 # {"status": "ok"}
+
+curl http://localhost:8888/
+# {
+#   "status": "ok",
+#   "judge_model": "qwen3.5:2b",
+#   "cheap_model": "qwen3.5-flash",
+#   "expensive_model": "qwen3.6-plus"
+# }
+```
+
+---
+
+## ⚙️ 配置选项
+
+所有配置项位于 `config.yaml` 文件：
+
+```yaml
+server:
+  host: "localhost"        # 监听地址，使用 "0.0.0.0" 允许外部访问（需注意安全）
+  port: 8888               # 服务端口
+
+judge:
+  model: "qwen3.5:2b"      # Ollama 复杂度评测模型
+  ollama_host: "localhost" # Ollama 服务器地址
+  ollama_port: 11434       # Ollama 端口
+  timeout: 8               # Ollama 请求超时（秒）
+  truncate_limit: 2000     # 用户输入截断限制（字符数）
+
+routing:
+  cheap_model: "qwen3.5-flash"    # 轻量级任务模型 (复杂度 < 阈值)
+  expensive_model: "qwen3.6-plus" # 重量级任务模型 (复杂度 ≥ 阈值)
+  threshold: 6                    # 路由决策阈值
+
+dashscope:
+  api_key: ""              # DashScope API 密钥 (必需)
+  base_url: "..."          # DashScope 端点 URL
+
+client:
+  max_connections: 100            # 最大连接数
+  max_keepalive_connections: 20   # 最大长连接数
+  keepalive_expiry: 60.0          # Keepalive 超时（秒）
+  default_timeout: 60.0           # 默认超时（秒）
+```
+
+### 命令行参数
+
+```bash
+# 指定配置文件
+python3 model_router.py --config custom.yaml
+
+# 覆盖端口（从 config.yaml 读取）
+python3 model_router.py --port 9000
+
+# 覆盖主机地址
+python3 model_router.py --host 0.0.0.0
 ```
 
 ---
@@ -212,7 +328,7 @@ curl http://localhost:8888/health
 curl http://localhost:8888/
 # {
 #   "status": "ok",
-#   "judge_model": "qwen2.5:1.5b",
+#   "judge_model": "qwen3.5:2b",
 #   "cheap_model": "qwen3.5-flash",
 #   "expensive_model": "qwen3.6-plus"
 # }
@@ -276,8 +392,9 @@ curl http://localhost:8888/
 | 模块 | 职责 | 关键技术 |
 |------|------|---------|
 | FastAPI Server | 请求接收与响应 | FastAPI, uvicorn |
-| HTTP Client Pool | 连接复用与超时控制 | httpx.AsyncClient |
-| Complexity Judge | 本地模型评估 | Ollama API |
+| HTTP Client Pool | 连接复用与超时控制 | httpx.AsyncClient (双客户端) |
+| Message Filter | 提取真实用户指令 | `extract_text_content`, `is_valid_user_message` |
+| Complexity Judge | 本地模型评估 | Ollama `/api/generate` |
 | Routing Logic | 决策引擎 | 规则引擎 |
 | Proxy to DashScope | 流式转发与 token 统计 | SSE passthrough |
 
@@ -291,15 +408,25 @@ curl http://localhost:8888/
 
 **上下文隔离** - 移除 system prompt 在 judging 中的影响，专注于用户真实意图
 
+**双 HTTP 客户端管理 (2026-04-12)**
+- `_global_client`: 用于 DashScope 上游请求，`timeout=60.0s`
+- `_ollama_client`: 独立 Ollama 专用客户端，`timeout=8.0s`
+- 独立超时配置确保快速失败和资源释放
+
+**安全性增强 (2026-04-12)**
+- `HOST` 从 `0.0.0.0` 改为 `localhost` (2026-04-12)，限制外部访问
+- Judge 模型升级为 `qwen3.5:2b`，提升指令跟随能力
+
 **FIFO 响应排序 (2026-04-10)**
 - 并发请求按提交顺序返回结果
 - Buffer-first 模式：先完整收集响应，再按序 release
 - 超时防死锁机制：简单模型 30s/复杂模型 60s
 - 错误时自动入队，避免队列永久阻塞
-**连接池管理 (2026-04-10)** - 已简化，使用 httpx.AsyncClient 全局单例维持连接池
+
+**连接池管理 (2026-04-10)** - 简化设计，使用 httpx.AsyncClient 全局单例维持连接池
 ```python
 _global_client = httpx.AsyncClient(
-    timeout=300.0,
+    timeout=60.0,
     limits=httpx.Limits(
         max_connections=100,
         max_keepalive_connections=20,
@@ -315,33 +442,46 @@ wait = 0.5 * (2**attempt) + random.uniform(0, 0.3)
 
 **流式传输透明透传** - 字节级转发，零格式损耗
 
-**FIFO 响应排序 (2026-04-10)**
-- 并发请求按提交顺序返回结果
-- Buffer-first 模式：先完整收集响应，再按序 release
-- 超时防死锁机制：简单模型 30s/复杂模型 60s
-- 错误时自动入队，避免队列永久阻塞
-
 ---
 
 ## 📁 项目结构
 
 ```
-claude-code-model-router/
-├── model_router.py          # 主程序 (320 lines)
-├── README.md                # 此文件
-├── docs/
-│   └── model-router-design.md  # 详细设计文档
+model-router/
+├── model_router.py          # 主程序 (使用 config.py)
+├── config.py                # 配置加载模块 ⭐ 新增 (v1.0+)
+├── config.example.yaml      # 配置示例文件
+├── config.yaml              # 实际配置文件（已 .gitignore）⚠️
+├── setup_config.sh          # 交互式配置脚本 ⭐ 新增 (v1.0+)
 ├── start_llm.sh             # 启动脚本 (macOS)
 ├── stop_llm.sh              # 停止脚本 (macOS)
-└── claude_settings.sh       # 环境变量配置
+├── .gitignore               # Git ignore 配置 ⭐ 新增 (v1.0+)
+├── README.md                # 项目文档
+├── CHANGELOG.md             # 变更日志
+└── docs/
+    └── model-router-design.md  # 详细设计文档
 ```
+
+**新增核心文件** (v1.0+):
+- `config.py`: 配置加载器，支持 YAML + 环境变量 + CLI 参数三级优先级
+- `setup_config.sh`: 交互式 API Key 配置工具
+- `.gitignore`: 保护敏感配置不提交到仓库
 
 ---
 
 ## 🔮 未来演进方向
 
-- ✅ **[x] 精准指令过滤** - 2026-04-10 已实现：自动排除工具响应，只提取真实用户意图
-- ✅ **[x] FIFO 响应排序** - 2026-04-10 已实现：按提交顺序返回，超时防死锁
+### 已实现功能 (v1.0+)
+
+- ✅ **[x] 配置系统** - YAML + 环境变量 + CLI 参数三级优先级
+- ✅ **[x] API Key 安全隔离** - config.yaml 加入 .gitignore，提供交互式设置脚本
+- ✅ **[x] 精准指令过滤** - 自动排除工具响应，只提取真实用户意图
+- ✅ **[x] FIFO 响应排序** - 按提交顺序返回，超时防死锁
+- ✅ **[x] 双 HTTP 客户端** - 独立 Ollama 专用客户端，优化超时配置
+- ✅ **[x] 安全性加固** - localhost 默认绑定，防止外部未授权访问
+
+### 计划功能
+
 - **[ ] 多级路由** - 支持 3+ 档位模型选择
 - **[ ] 缓存机制** - 重复 query 直接返回缓存结果
 - **[ ] 异步评测器** - 预评估降低延迟

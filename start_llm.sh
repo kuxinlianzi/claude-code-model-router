@@ -92,7 +92,9 @@ if check_port $OLLAMA_PORT; then
 fi
 
 log "Starting ollama serve..."
-ollama serve > /tmp/ollama.log 2>&1 &
+# Redirect stdout/stderr to suppress all logs except our own
+ollama serve >/dev/null 2>/tmp/ollama.log &
+OLLAMA_PID=$!
 sleep 2
 
 if ! wait_for_service $OLLAMA_PORT "Ollama" 15; then
@@ -103,6 +105,25 @@ if ! wait_for_service $OLLAMA_PORT "Ollama" 15; then
 fi
 
 log "Ollama started successfully"
+
+# ─── Step 1.5: Load Judge Model ─────────────────────────────────────────────
+
+# Read judge model from config file if it exists
+CONFIG_FILE="config.yaml"
+if [ -f "$CONFIG_FILE" ]; then
+    JUDGE_MODEL=$(grep -A5 "^judge:" "$CONFIG_FILE" | grep "model:" | head -1 | sed 's/.*model: *"\(.*\)"/\1/')
+else
+    JUDGE_MODEL="qwen3.5:2b"
+fi
+
+log "Loading judge model: $JUDGE_MODEL..."
+if ! ollama list 2>/dev/null | grep -q "$JUDGE_MODEL"; then
+    ollama pull "$JUDGE_MODEL"
+else
+    log "Model $JUDGE_MODEL already exists, skipping pull"
+fi
+log "Judge model loaded"
+
 echo ""
 
 # ─── Step 2: Start Model Router ──────────────────────────────────────────────

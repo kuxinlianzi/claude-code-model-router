@@ -1,5 +1,7 @@
 # 智能路由网关（Model Router）设计文档
 
+> 最后更新: 2026-04-12
+
 ## 1. 概述
 
 智能路由网关是一个用于根据任务复杂度自动选择合适大语言模型的代理服务器。其核心理念是**"用简单的模型判断任务的难度，然后调度更强的模型完成复杂任务"**，从而在保证质量的同时优化成本。
@@ -15,6 +17,16 @@
 ```
 用户 → Anthropic 格式请求 → [本网关] → 复杂度评估 → 路由至 DashScope → 返回结果
 ```
+
+### 1.3 配置概览
+
+| 组件 | 当前配置 | 说明 |
+|------|----------|------|
+| Judge 模型 | `qwen3.5:2b` | 本地复杂度评测模型 (Ollama) |
+| 轻量级目标 | `qwen3.5-flash` | Level 1-5 任务路由目标 |
+| 重量级目标 | `qwen3.6-plus` | Level 6-10 任务路由目标 |
+| 服务地址 | `localhost:8888` | 本地监听 (已安全加固) |
+| DashScope | Anthropic 兼容端点 | 上游 API 服务 |
 
 ---
 
@@ -159,11 +171,36 @@
 | 模块 | 职责 | 关键技术 |
 |------|------|---------|
 | **FastAPI Server** | 接收请求、消息过滤、路由分发、响应返回 | FastAPI, uvicorn |
-| **HTTP Client Pool** | 连接复用、超时控制、重试机制 | httpx.AsyncClient |
+| **HTTP Client Pool** | 连接复用、超时控制、重试机制 | httpx.AsyncClient (双客户端) |
 | **Message Filter** | 提取真实用户指令、过滤工具响应和 UI 干扰 | `extract_text_content`, `is_valid_user_message` |
-| **Complexity Judge** | 调用本地小模型评估任务难度 | Ollama `/api/generate` |
+| **Complexity Judge** | 调用本地小模型评估任务难度 | Ollama `/api/generate` (独立客户端) |
 | **Routing Logic** | 根据分数决定目标模型 | 规则引擎 |
 | **Proxy to DashScope** | 转发请求、流式传输、token 统计 | SSE passthrough |
+
+### 3.3 双 HTTP 客户端设计
+
+系统维护两个独立的 httpx.AsyncClient 实例：
+
+```python
+# 1. 全局客户端 — 用于 DashScope 上游请求
+_global_client = httpx.AsyncClient(
+    timeout=60.0,  # 默认超时 (比原始 300s 更安全)
+    limits=httpx.Limits(
+        max_connections=100,
+        max_keepalive_connections=20,
+        keepalive_expiry=60.0,
+    ),
+)
+
+# 2. Ollama 专用客户端 — 用于本地 Judge 模型调用
+_ollama_client = httpx.AsyncClient(timeout=8.0)  # 独立短超时
+```
+
+**设计理由**：
+- 全局客户端 `60s` 默认超时避免长时间阻塞（从原 `300s` 优化）
+- Ollama 客户端独立管理 `8s` 超时，确保复杂度评估快速失败
+- 独立生命周期，互不影响
+- `HOST` 从 `0.0.0.0` 改为 `localhost`，限制本地访问
 
 ---
 
@@ -173,12 +210,14 @@
 
 ```python
 _global_client = None
+_ollama_client = None
 
 def get_http_client():
+    """全局 httpx.AsyncClient，用于 DashScope 请求。"""
     global _global_client
     if _global_client is None:
         _global_client = httpx.AsyncClient(
-            timeout=300.0,
+            timeout=60.0,  # 优化: 从 300s 降至 60s
             limits=httpx.Limits(
                 max_connections=100,
                 max_keepalive_connections=20,
@@ -186,12 +225,22 @@ def get_http_client():
             ),
         )
     return _global_client
+
+def get_ollama_client():
+    """Ollama 专用客户端，独立超时配置。"""
+    global _ollama_client
+    if _ollama_client is None:
+        _ollama_client = httpx.AsyncClient(timeout=float(OLLAMA_TIMEOUT))
+    return _ollama_client
 ```
 
 **设计理由**：
 - 全局单例避免重复创建开销
+- `timeout=60.0` 避免长时间阻塞（从原 `300s` 优化）
 - `max_connections=100` 支持高并发
 - `keepalive_expiry=60s` 减少握手次数
+- Ollama 客户端独立管理 `8s` 超时，确保快速失败
+- `HOST` 改为 `localhost`，限制外部访问
 
 ### 4.2 指数退避重试
 
@@ -245,36 +294,51 @@ if body.get("stream"):
 
 **2026-04-10 更新**: 改用 `/api/generate` 端点，精简 Prompt 结构，提升小模型指令跟随能力
 
+**Judge 模型升级**: `qwen3.5:2b` (当前版本)
+
+**API 端点优化**: `/api/chat` → `/api/generate`
+
+**超时配置优化**:
+- 全局客户端：`300s` → `60s`
+- Ollama 专用客户端：独立 `8s` 超时
+
+**安全性增强**:
+- HOST: `0.0.0.0` → `localhost` (2026-04-12)
+
+**最新配置** (2026-04-12):
+```python
+"model": "qwen3.5:2b",
+"prompt": prompt,
+"stream": False,
+"think": False,  # 禁用思考模式，防止输出预算消耗
+"options": {"temperature": 0, "num_predict": 512},
+```
+
 **Prompt 结构**：
 
 ```
-你是一位顶级的 LLM 路由网关。请评估用户输入的语义复杂度和逻辑推理深度，输出 1-10 的复杂度分数。
+You are a top-tier LLM Router Gateway. Evaluate the semantic complexity and logical reasoning depth of the user's input, and output a complexity score from 1 to 10.
 
-=== 轻量级区间：Level 1-5（执行层任务：无深度推理，模式匹配）===
-Level 1: 问候、感谢、无意义测试
-Level 2: 简单单词翻译、拼写检查、大小写转换
-Level 3: 基础知识问答、从短文本提取显式信息
-Level 4: 简单摘要、写例行邮件、基本格式化
-Level 5: 带少量约束的文本生成、非常基础的代码
+=== Lightweight Interval: Levels 1-5 (Execution-layer tasks: no deep reasoning, pattern matching) ===
+Level 1: Greetings, thanks, meaningless tests (e.g., 'test', 'hello').
+Level 2: Simple word translation, spell check, case conversion.
+Level 3: The Basics, QA (e.g., 'how big is Earth'), extracting explicit info from short text (names, dates).
+Level 4: Simple summarization, writing a routine email, basic formatting (paragraph to list).
+Level 5: Text generation with a few constraints (e.g., 'write a 300-word essay on spring'), very basic code (e.g., 'write a bubble sort in Python').
+--- >> Routing Threshold: Above this line requires strong reasoning ability << ---
 
---- >> 超过此线需要强推理能力 << ---
+=== Heavyweight Interval: Levels 6-10 (Thinking-layer tasks: multi-step reasoning, logical deduction, deep expertise) ===
+Level 6: Creative tasks with 3+ constraints, medium-difficulty code generation, logic puzzle analysis, deep analysis requiring specific context.
+Level 7: Complex code debugging, API integration design, database schema planning, error log troubleshooting.
+Level 8: Deep analysis in law/medicine/finance/academia, chart-based logical reasoning with heavy data, academic-level writing or polishing.
+Level 9: Multi-step planning, Monumental Task (e.g., 'plan a complete New Year event with budget, schedule, and promotional copy').
+Level 10: Extremely complex math derivations, innovative algorithm design beyond conventional thinking, massive intertwined novel worldbuilding.
 
-=== 重量级区间：Level 6-10（思考层任务：多步推理，逻辑演绎，深度专业知识）===
-Level 6: 创意任务 (3+ 约束)、中等难度代码、逻辑谜题
-Level 7: 复杂代码调试、API 集成设计、数据库模式规划
-Level 8: 法律/医学/金融/学术深度分析、图表数据推理
-Level 9: 多步骤规划、大型任务策划
-Level 10: 复杂数学推导、创新算法设计、庞大世界观构建
+Evaluate considering: (1) Multi-step reasoning needed? (2) Many constraints? (3) Requires professional expertise? (4) High cost of error?
+Respond with ONLY a single integer from 1 to 10, nothing else.
 
-评估考虑：
-1. 是否需要多步骤推理？
-2. 有多少个约束条件？
-3. 是否需要专业领域知识？
-4. 错误的代价有多高？
-
-只输出一个 1-10 的整数。
-
-[用户任务内容]
+User input: {context}
+Complexity score:
 ```
 
 **Prompt 结构优化**：
@@ -291,16 +355,51 @@ Level 10: 复杂数学推导、创新算法设计、庞大世界观构建
 ```python
 async def extract_text_content(message: dict) -> str:
     """从 message dict 中提取纯文本内容"""
-    ...
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, str):
+                    texts.append(text.strip())
+        return " ".join(texts)
+    return str(content).strip()
+
 
 def is_valid_user_message(text: str) -> bool:
-    """过滤工具响应和 UI 干扰"""
+    """检查是否为有效的自然语言用户消息"""
+    text_lower = text.lower().strip()
+    
+    # Special handling for "test" - it's a valid (low complexity) input
+    if text_lower in ("test", "testing"):
+        return True
+    
+    # Filter out tool-related content and UI artifacts
     if any(pattern in text_lower for pattern in [
         '<tool_use_id', '<tool-result', 'tool_result',
+        '<tool-use', 'tool_use_', 'toolresult',
+        'command running in background', 'output is being written to',
         '<system-reminder', 'sessionstart hook',
-        'exit code', 'parse error', '/clear', ...
+        'task # created successfully',
+        'exit code', 'parse error', 'syntaxerror',
+        'blocked', 'not ready', '/clear', '<tool_use_error>',
+        '<tool-use-error>', 'sleep followed by',
+        '<retrieval_status>', 'background agent completed'
     ]):
         return False
+    
+    # Must contain at least some letters, digits, or Chinese/Japanese characters
+    has_letters = any(c.isalpha() for c in text)
+    has_digits = any(c.isdigit() for c in text)
+    has_chinese = any('\u4e00' <= c <= '\u9fff' for c in text)
+    has_japanese = any('\u3040' <= c <= '\u30ff' for c in text)
+    
+    if not (has_letters or has_digits or has_chinese or has_japanese):
+        return False
+    
     return True
 ```
 
@@ -311,56 +410,45 @@ def is_valid_user_message(text: str) -> bool:
 | `/api/chat` | `messages=[{"role": "user", "content": "..."}]` | ⭐⭐ |
 | `/api/generate` | `prompt="instruction\n\nUser input\nOutput:"` | ⭐⭐⭐⭐⭐ |
 
-**原因**: `qwen2.5:1.5b` 的指令跟随能力较弱，需要更清晰的 instruction→context→output 三段式结构。
+**原因**: qwen3.5:2b 的指令跟随能力较弱，需要更清晰的 instruction→context→output 三段式结构。
 
 **C. 错误处理增强**
 
 ```python
-# 解析逻辑：优先匹配行首数字，fallback 到全文搜索 1-9 单 digit
-for line in lines:
-    match = re.match(r'^(\d+)', stripped)
-    ...
-if score is None:
-    log(f"[WARN] Judge parsing error...")
-    return 5  # 降级策略
-```
-
----
-
----
-
-### 4.6 默认降级策略
-
-```python
 try:
-    score = await judge_complexity(user_messages, system_prompt)
+    client = get_ollama_client()  # 使用独立 Ollama 客户端
+    resp = await client.post(f"http://localhost:{OLLAMA_PORT}/api/generate", json=payload)
+    data = resp.json()
+    content = data.get("response", "").strip()
+    ...
+    # 多阶段解析策略
+    # 1. 优先匹配行首数字
+    # 2. Fallback 到全文搜索 1-9 单 digit
+    # 3. 最终降级到默认值 5
+except httpx.TimeoutException as e:
+    log(f"[WARN] Judge timeout ({OLLAMA_TIMEOUT}s), defaulting to 5")
+    return 5
+except (ValueError, TypeError) as e:
+    log(f"[WARN] Judge parsing error: '{content}', error: {e}, defaulting to 5")
+    return 5
 except Exception as e:
     log(f"[WARN] Judge failed ({e}), defaulting to 5")
     return 5
 ```
 
-### 4.6 默认降级策略
-
-当评测器失败时回退到中等复杂度 (5)，保证服务可用性。
-
 ---
 
 ## 5. 配置项
 
-| 配置 | 默认值 | 说明 |
+| 配置 | 当前值 | 说明 |
 |------|--------|------|
-| `HOST` | `0.0.0.0` | 监听地址 |
+| `HOST` | `localhost` | 监听地址 (已安全加固) |
 | `PORT` | `8888` | 服务端口 |
-| `JUDGE_MODEL` | `qwen2.5:1.5b` | 本地复杂度评测模型 |
+| `JUDGE_MODEL` | `qwen3.5:2b` | 本地复杂度评测模型 |
 | `OLLAMA_PORT` | `11434` | Ollama 服务端口 |
 | `OLLAMA_TIMEOUT` | `8s` | 评测请求超时时间 |
 | `CHEAP_MODEL` | `qwen3.5-flash` | 轻量级路由目标 |
 | `EXPENSIVE_MODEL` | `qwen3.6-plus` | 重量级路由目标 |
-| `DASHSCOPE_API_KEY` | — | DashScope API 密钥 |
-
-**扩展建议**：
-- 可通过环境变量注入敏感配置
-- 未来可支持动态切换模型而不重启服务
 
 ---
 
@@ -387,10 +475,10 @@ GET /
 ```json
 {
   "status": "ok",
-  "judge_model": "qwen2.5:1.5b",
+  "judge_model": "qwen3.5:2b",
   "cheap_model": "qwen3.5-flash",
   "expensive_model": "qwen3.6-plus",
-  "uptime": "2026-04-09 12:34:56"
+  "uptime": "2026-04-12 12:34:56"
 }
 ```
 
@@ -552,9 +640,9 @@ curl -X POST http://localhost:8888/v1/messages \
 
 ---
 
-## 7. 未来演进方向
+## 9. 未来演进方向
 
-### 7.1 多级路由（3+ 档位）
+### 9.1 多级路由（3+ 档位）
 
 当前二分法可扩展为三级：
 
@@ -564,7 +652,7 @@ Level 4-6  → 均衡模型（如 qwen3.5-flash）
 Level 7-10 → 最强模型（如 qwen3.6-plus）
 ```
 
-### 7.2 缓存机制
+### 9.2 缓存机制
 
 对重复的相同 query 直接返回缓存结果，避免重复调用：
 
@@ -574,7 +662,7 @@ if cache.exists(cache_key):
     return cache.get(cache_key)
 ```
 
-### 7.3 异步评测器
+### 9.3 异步评测器
 
 当前复杂度评测阻塞主线程，可改造为独立协程预先评估：
 
@@ -584,7 +672,7 @@ score_task = asyncio.create_task(judge_complexity(...))
 score = await score_task
 ```
 
-### 7.4 A/B 测试框架
+### 9.4 A/B 测试框架
 
 对不同任务随机分配两种评分策略，对比效果：
 
@@ -595,9 +683,22 @@ else:
     score = await judge_complexity(...)
 ```
 
+### 9.5 Docker 容器化部署
+
+提供 Dockerfile 和 docker-compose.yml，实现一键部署：
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["python", "model_router.py"]
+```
+
 ---
 
-## 7.5 总结
+## 10. 总结
 
 智能路由网关的核心价值在于**"用最小代价实现最佳效果平衡"**：
 
@@ -607,5 +708,11 @@ else:
 | **质量稳** | 复杂任务自动路由到强模型，保证输出水平 |
 | **易部署** | 仅依赖本地 Ollama + DashScope，无需额外基础设施 |
 | **透明化** | 对客户端完全隐藏路由逻辑，API 不变 |
+| **安全性** | localhost 限制访问，独立超时配置防止阻塞 |
+| **可配置** | YAML 配置文件 + 环境变量支持，适配多种环境 |
 
-这套设计的精髓是**"用小型智能筛选大型需求"**——用一个 1.5B 的小模型做守门员，决定是否要调用强大的 3.6B+ 模型，既经济又高效。
+这套设计的精髓是「用小型智能筛选大型需求」——用一个 2B 的小模型做守门员，决定是否要调用更强的模型，既经济又高效。
+
+---
+
+*文档版本：2026-04-12 (config system v1.0)*

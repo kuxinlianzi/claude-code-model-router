@@ -5,9 +5,15 @@ Model Router Proxy for Claude Code
 Receives Anthropic-format requests → judges complexity via Ollama →
 routes to DashScope Anthropic-compatible endpoint (transparent passthrough).
 
+Configuration:
+    - Config file: config.yaml (highest priority)
+    - Environment variables: MODEL_ROUTER_* (medium priority)
+    - Default values: code-defined (lowest priority)
+
 Usage:
-    python3 model_router.py
-    python3 model_router.py --port 9000
+    python3 model_router.py                     # Use default config.yaml
+    python3 model_router.py --config myconfig.yaml
+    DASHSCOPE_API_KEY=xxx python3 model_router.py
 """
 
 import json
@@ -15,13 +21,18 @@ import random
 import re
 import sys
 import time
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
+from pathlib import Path
 
-# ─── Global HTTP Client with connection pooling ────────────────────────
+from config import get_config, reset_config
 
+# ─── Global Configuration and HTTP Client ──────────────────────────────
+
+config = None  # Will be initialized in main()
 _global_client = None
 
 
@@ -30,11 +41,11 @@ def get_http_client():
     global _global_client
     if _global_client is None:
         _global_client = httpx.AsyncClient(
-            timeout=300.0,
+            timeout=config.default_timeout,
             limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=60.0,
+                max_connections=config.max_connections,
+                max_keepalive_connections=config.max_keepalive_connections,
+                keepalive_expiry=config.keepalive_expiry,
             ),
         )
     return _global_client
@@ -65,19 +76,6 @@ async def request_with_retry(client, method, url, headers, data, retries=3):
                 await httpx.sleep(wait)
 
     raise last_exception
-
-# ─── Configuration ───────────────────────────────────────────────────
-
-HOST = "0.0.0.0"
-PORT = 8888
-JUDGE_MODEL = "qwen2.5:1.5b"
-OLLAMA_PORT = 11434
-OLLAMA_TIMEOUT = 8
-DASHSCOPE_API_KEY = "your-api-key-here"
-# DashScope native Anthropic-compatible endpoint — no format conversion needed
-DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/apps/anthropic"
-CHEAP_MODEL = "qwen3.5-flash"
-EXPENSIVE_MODEL = "qwen3.6-plus"
 
 # ─── App ─────────────────────────────────────────────────────────────
 
@@ -153,8 +151,8 @@ async def judge_complexity(user_messages: list, system_prompt: str = "") -> int:
         text = await extract_text_content(user_messages[-1])
         context = text if text else "(no valid messages)"
 
-    if len(context) > 2000:
-        context = context[:2000] + "..."
+    if len(context) > config.truncate_limit:
+        context = context[:config.truncate_limit] + "..."
 
     # Use /api/generate for better instruction-following with small models
     prompt = (
@@ -178,15 +176,19 @@ async def judge_complexity(user_messages: list, system_prompt: str = "") -> int:
     )
 
     payload = {
-        "model": JUDGE_MODEL,
+        "model": config.judge_model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0, "num_predict": 3},
+        "think": False,  # Disable thinking mode for qwen3.5 — prevents thinking tokens from consuming output budget
+        "options": {"temperature": 0, "num_predict": 512},
     }
 
     try:
-        client = get_http_client()
-        resp = await client.post(f"http://localhost:{OLLAMA_PORT}/api/generate", json=payload)
+        ollama_client = httpx.AsyncClient(timeout=float(config.ollama_timeout))
+        resp = await ollama_client.post(
+            f"http://{config.ollama_host}:{config.ollama_port}/api/generate",
+            json=payload
+        )
         data = resp.json()
         content = data.get("response", "").strip()
 
@@ -231,6 +233,9 @@ async def judge_complexity(user_messages: list, system_prompt: str = "") -> int:
             return 5
 
         return score
+    except httpx.TimeoutException as e:
+        log(f"[WARN] Judge timeout ({OLLAMA_TIMEOUT}s), defaulting to 5")
+        return 5
     except (ValueError, TypeError) as e:
         log(f"[WARN] Judge parsing error: '{content}', error: {e}, defaulting to 5")
         return 5
@@ -249,7 +254,7 @@ async def proxy_to_dashscope(request: Request, model: str, complexity_score: int
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+        "Authorization": f"Bearer {config.dashscope_api_key}",
     }
 
     # Forward any extra headers from the client (except hop-by-hop)
@@ -268,7 +273,7 @@ async def proxy_to_dashscope(request: Request, model: str, complexity_score: int
                 resp = await request_with_retry(
                     client,
                     "post",
-                    f"{DASHSCOPE_BASE}/v1/messages",
+                    f"{config.dashscope_base_url}/v1/messages",
                     headers,
                     json.dumps(body).encode(),
                     retries=3,
@@ -319,7 +324,7 @@ async def proxy_to_dashscope(request: Request, model: str, complexity_score: int
             resp = await request_with_retry(
                 client,
                 "post",
-                f"{DASHSCOPE_BASE}/v1/messages",
+                f"{config.dashscope_base_url}/v1/messages",
                 headers,
                 json.dumps(body).encode(),
                 retries=3,
@@ -346,9 +351,9 @@ async def proxy_to_dashscope(request: Request, model: str, complexity_score: int
 async def root():
     return {
         "status": "ok",
-        "judge_model": JUDGE_MODEL,
-        "cheap_model": CHEAP_MODEL,
-        "expensive_model": EXPENSIVE_MODEL,
+        "judge_model": config.judge_model,
+        "cheap_model": config.cheap_model,
+        "expensive_model": config.expensive_model,
         "uptime": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -388,7 +393,7 @@ async def messages(request: Request):
     start = time.time()
     score = await judge_complexity(final_user_msgs, system_prompt)
     judge_time = time.time() - start
-    model = EXPENSIVE_MODEL if score >= 6 else CHEAP_MODEL
+    model = config.expensive_model if score >= config.threshold else config.cheap_model
 
     log(f"[complexity={score}/10] judge={judge_time:.2f}s → {model}")
 
@@ -412,19 +417,45 @@ async def messages(request: Request):
 # ─── Main ────────────────────────────────────────────────────────────
 
 def main():
-    port = PORT
-    if len(sys.argv) > 1 and sys.argv[1] == "--port":
-        port = int(sys.argv[2])
+    global config
+    config_file = None
 
-    log(f"Model Router started on {HOST}:{port}")
-    log(f"  Cheap model:  {CHEAP_MODEL}")
-    log(f"  Expensive model: {EXPENSIVE_MODEL}")
-    log(f"  Judge model:  {JUDGE_MODEL} (Ollama :{OLLAMA_PORT})")
-    log(f"  DashScope:    {DASHSCOPE_BASE}")
+    # Parse command line arguments
+    port = None
+    host = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--config" and i + 1 < len(sys.argv):
+            config_file = sys.argv[i + 1]
+        elif arg == "--port" and i + 1 < len(sys.argv):
+            port = int(sys.argv[i + 1])
+        elif arg == "--host" and i + 1 < len(sys.argv):
+            host = sys.argv[i + 1]
+
+    # Initialize config
+    try:
+        config = get_config(Path(config_file) if config_file else None)
+    except Exception as e:
+        print(f"[ERROR] Failed to load configuration: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # CLI args override config
+    if port:
+        config._config["server"]["port"] = port
+    if host:
+        config._config["server"]["host"] = host
+
+    server_host = config.server_host
+    server_port = config.server_port
+
+    log(f"Model Router started on {server_host}:{server_port}")
+    log(f"  Judge model:     {config.judge_model}")
+    log(f"  Cheap model:     {config.cheap_model} (≤{config.threshold-1})")
+    log(f"  Expensive model: {config.expensive_model} (≥{config.threshold})")
+    log(f"  Ollama:          {config.ollama_host}:{config.ollama_port}")
     log("  Press Ctrl+C to stop")
 
     import uvicorn
-    uvicorn.run(app, host=HOST, port=port, log_level="warning")
+    uvicorn.run(app, host=server_host, port=server_port, log_level="warning")
 
 
 if __name__ == "__main__":
