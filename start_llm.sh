@@ -111,7 +111,8 @@ log "Ollama started successfully"
 # Read judge model from config file if it exists
 CONFIG_FILE="config.yaml"
 if [ -f "$CONFIG_FILE" ]; then
-    JUDGE_MODEL=$(grep -A5 "^judge:" "$CONFIG_FILE" | grep "model:" | head -1 | sed 's/.*model: *"\(.*\)"/\1/')
+    # Extract value between quotes, stop at first closing quote (ignore comments)
+    JUDGE_MODEL=$(grep "^  model:" "$CONFIG_FILE" | head -1 | sed 's/.*model: *"\([^"]*\)".*/\1/')
 else
     JUDGE_MODEL="qwen3.5:2b"
 fi

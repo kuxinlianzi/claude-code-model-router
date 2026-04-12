@@ -162,10 +162,11 @@ class Config:
         """Initialize configuration from file and environment variables."""
         if config_file is None:
             # Try common locations
+            script_dir = Path(__file__).parent  # Directory where config.py lives
             candidates = [
-                Path("config.yaml"),           # Project root
-                Path("./config.yaml"),         # Relative
-                Path("/etc/model-router/config.yaml"),  # System-wide (Linux)
+                Path("config.yaml"),                          # Current working directory
+                script_dir / "config.yaml",                   # Same directory as this script
+                Path("/etc/model-router/config.yaml"),        # System-wide (Linux)
             ]
 
             for candidate in candidates:
